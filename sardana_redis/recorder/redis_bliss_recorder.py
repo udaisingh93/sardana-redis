@@ -5,6 +5,7 @@ from sardana_redis.utils.sardana_redis_utils import get_data_store
 from blissdata.redis_engine.encoding.numeric import NumericStreamEncoder
 from blissdata.redis_engine.encoding.json import JsonStreamEncoder
 from blissdata.schemas.scan_info import ScanInfoDict, DeviceDict, ChainDict, ChannelDict
+from PyTango import DeviceProxy 
 import os
 import tango
 import datetime
@@ -165,7 +166,7 @@ class RedisBlissRecorder(DataRecorder):
         self.nx_save_single_file = nexus_writer_opts.get('singleNXFile', False)
         self.writerFile = nexus_writer_opts.get('scanFile', None)
         self.session = nexus_writer_opts.get('session', 'test_session')
-
+        
         if self.scanDir is None or self.writerFile is None:
             return scanPath
 
@@ -232,6 +233,7 @@ class RedisBlissRecorder(DataRecorder):
         return dataset_file, masterfiles, images_path
 
     def scan_info(self, snap_dict, ddesc_dict):
+        # self.macro.info(ddesc_dict)
         # Files like at the ESRF (not required to do it like this)
         filename, masterfiles, images_path = self.file_info(
             singleFile=self.nx_save_single_file)
@@ -299,35 +301,49 @@ class RedisBlissRecorder(DataRecorder):
         except Exception:
             import getpass
             scan_info["user_name"] = getpass.getuser()
-
-
-        scan_info["plots"].append({"kind": "curve-plot"})
-
+            
+        
+        # scan_info["plots"].append({"kind": "curve-plot"})
+        axes=[]
         # Add curves selected in measurement group for plotting
-        for elem in ddesc_dict.items():
-            try:
-                plot_type = elem[1].get("plot_type", 0)
-                plot_axes = elem[1].get("plot_axes", [])
-                name = elem[1].get("label", "")
-                axes = []
-                if plot_type == 1:
-                    for axis in plot_axes:
-                        if "<idx>" in axis:
-                            axis = "#Pt No"
-                        axes.append({"kind": "curve", "x": axis, "y": name})
-                    scan_info["plots"].append(
-                        {"kind": "curve-plot", "name": name, "items": axes})
-                elif plot_type == 2:
-                    self.info("Image plot not implemented yet")
-            except IndexError:
-                continue
-
+        axis_list=self.devices['axis']['channels']
+        if axis_list is None:
+            axis_list=self.devices['timer']['channels'][0]
+        mca_list=self.devices['mca']['channels']
+        lima_list=self.devices['mca']['channels']
+        counter_list=self.devices['counters']['channels']
+        self.macro.info(f"print {counter_list}")
+        # if counter_list is not None:
+        #     if len(axis_list)>1:
+        #         for axis in axis_list:
+        #             axes.append({"kind": "scatter", "x": axis, "y": counter_list})
+        #     else:
+        #         for name in counter_list:
+        #             axes.append({"kind": "curve", "x": ddesc_dict[name].get('plot_axes',[]), "y": name})
+        # "items": [
+        #     {
+        #       "kind": "curve",
+        #       "x": "axis:phymotionmotor2"
+        #     }
+        #   ]
+        for axis in axis_list:
+            axes.append({"kind": "curve","x":axis})
+        # if counter_list is not None:
+        #     for axis in axis_list:
+        #         axes.append({"kind": "scatter", "x": axis, "y": counter_list})
+                
+        if len(axis_list)>1:
+            scan_info["plots"].append({"kind": "scatter-plot","name": "Scatter", "items": axes})
+        else:
+            scan_info["plots"].append({"kind": "curve-plot", "name": "Curve", "items": axes})
+   
         validate_scan_info(scan_info)
         return scan_info
 
     def _startRecordList(self, recordlist):
 
         header = dict(recordlist.getEnviron())
+        self.macro.info(recordlist)
 
         # sanitize numpy.int64 types
         datadesc = []
@@ -354,6 +370,10 @@ class RedisBlissRecorder(DataRecorder):
             name="timer", channels=[], metadata={})
         self.devices["counters"] = DeviceDict(
             name="counters", channels=[], metadata={})
+        self.devices["mca"] = DeviceDict(
+            name="mca", channels=[], metadata={})
+        self.devices["lima"] = DeviceDict(
+            name="lima", channels=[], metadata={})
         self.devices["axis"] = DeviceDict(
             name="axis", channels=[], metadata={})
 
@@ -383,18 +403,18 @@ class RedisBlissRecorder(DataRecorder):
     def prepare_streams(self, datadesc_list, header):
 
         # declare the streams in the scan (all Numeric in our test, TODO: consider references, 1d,...)
-        self.macro.info(datadesc_list)
         self.stream_list = {}
         for elem in datadesc_list:
-            # if "point_nb" in elem["name"]:
-            #     continue
+            if "point_nb" in elem["name"]:
+                continue
 
             name = elem["name"]
             label = elem["label"]
             dtype = elem["dtype"]
             shape = elem["shape"]
+            dim = len(shape)
             unit = ""
-           # self.macro.info(f"device name {name},label:{label},dtype:{dtype},header:{header}")
+            # self.macro.info(f"device name {name},label:{label},dtype:{dtype},header:{header}")
             if "unit" in elem:
                 unit = elem["unit"]
 
@@ -402,8 +422,13 @@ class RedisBlissRecorder(DataRecorder):
             if "timestamp" in name:
                 device_type = "timer"
             elif name in header["counters"]:
-                device_type = "counters"
-
+                if dim ==1:
+                 device_type = "mca"
+                elif dim == 2:
+                 device_type = "lima"
+                else:
+                 device_type = "counters"
+	    
             self.devices[device_type]['channels'].append(label)
             self.channels[label] = ChannelDict(device=device_type,
                                                dim=len(shape),
@@ -413,24 +438,28 @@ class RedisBlissRecorder(DataRecorder):
             if 'value_ref_enabled' in elem:
                 if elem['value_ref_enabled']:
                     encoder = JsonStreamEncoder()
+                    dev = self.macro.getDevice(elem["label"])
+                    lima_url= dev.read_attribute("Lima_DeviceName").value
+                    lima_dev = tango.DeviceProxy(lima_url)
                     info = {
-                            "dim": 2,
-                            "format": "lima_v1",
-                            "dtype": "uint64",
-                            "shape": elem['shape'],
-                            "lima_info": {
-                        "protocol_version": 1,
-                        "server_url": "tango://haspp08bliss.desy.de:10000/p08bliss/limaccds/eiger2",
-                        "buffer_max_number": 5312,
-                        "acquisition_offset": 0,
-                        "frame_per_acquisition": 11,
-                        "file_offset": 0,
-                        "frame_per_file": 100,
-                        "file_format": "hdf5",
-                        "file_path": os.path.join("/tmp/limaeiger/scan_%04d.h5"),
-                        "data_path": "/entry_0000/esrf-id00a/lima_simulator/data",
-                         },
-                    }
+        		    "dim": 2,
+        		    "format": "lima_v1",
+        		    "dtype": "uint64",
+        		    "shape": elem['shape'],
+        		    "label": elem['label'],
+        		    "lima_info": {
+            		"protocol_version": 1,
+            		"server_url": f"tango://{lima_url}",
+            		"buffer_max_number": lima_dev.read_attribute('buffer_max_number').value,
+            		"acquisition_offset": lima_dev.read_attribute('acc_offset_before').value,
+            		"frame_per_acquisition": lima_dev.read_attribute('acq_nb_frames').value,
+            		"file_offset": 0,
+            		"frame_per_file": lima_dev.read_attribute('saving_frame_per_file').value,
+            		"file_format": lima_dev.read_attribute('saving_format').value,
+            		"file_path": os.path.join("/tmp/limaeiger/scan_%04d.h5"),
+            		"data_path": "/entry_0000/esrf-id00a/lima_simulator/data",
+        	         },
+    		    }
                     hdf5ref_stream = self.scan.create_stream(label, encoder, info=info)
                     self.stream_list[name] = hdf5ref_stream
                 else:
@@ -447,11 +476,13 @@ class RedisBlissRecorder(DataRecorder):
         self.acq_chain["axis"] = ChainDict(
             top_master="timer",
             devices=list(self.devices.keys()),
-            scalars=[],
-            spectra=[],
-            images=[],
-            master={})
-
+            scalars=[f"{channel}" for device, details in self.devices.items() if device not in [ 'timer','mca','lima'] for channel in details['channels']],
+            spectra=[f"{channel}" for device, details in self.devices.items() if device == 'mca' for channel in details['channels']],
+            images=[f"{channel}" for device, details in self.devices.items() if device =='lima'  for channel in details['channels']],
+            master = { "scalars": [f"{channel}" for device, details in self.devices.items() if device == 'timer' for channel in details['channels']],
+            "spectra": [],
+            "images": [],})
+        # self.macro.info(self.devices)
     def _endRecordList(self, recordlist):
         for stream in self.stream_list.values():
             try:
@@ -478,6 +509,9 @@ class RedisBlissRecorder(DataRecorder):
                 self.warning("Stream for {} not found".format(k))
                 continue
             if ch_stream.info.get('dim')==2:
-                ch_stream.send({"last_index": 1, "last_index_saved": 1})
+                dev = self.macro.getDevice(ch_stream.info.get('label'))
+                ch_stream.send({"last_index": dev.read_attribute('last_image_ready').value, "last_index_saved": dev.read_attribute('last_image_saved').value})
+                
             else:
                 ch_stream.send(v)
+	   
